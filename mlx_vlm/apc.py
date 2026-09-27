@@ -466,11 +466,20 @@ def hash_image_payload(
     """
     if pixel_values is not None:
         try:
+            # Differently sized images arrive as a list of per-image tensors
+            # (or nested slices), which cannot be stacked into one array:
+            # fold them element-wise, keeping each image's position so a gap
+            # cannot shift the others.
             if isinstance(pixel_values, (list, tuple)):
-                folded = _hash_payload(pixel_values)
-                if folded is not None:
+                folded, seen = SEED_PARENT_HASH, False
+                for item in pixel_values:
+                    sub = _hash_payload(item)
+                    seen = seen or sub is not None
+                    folded = _stable_int_hash(folded, 0 if sub is None else sub)
+                if seen:
                     return folded
-            return _tensor_content_hash(pixel_values)
+            else:
+                return _tensor_content_hash(pixel_values)
         except Exception:
             pass
 
