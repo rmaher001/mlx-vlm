@@ -1012,6 +1012,21 @@ def test_hashes_and_dependencies():
     assert P.model_key_dependencies(None, None) == ()
 
 
+def test_image_hash_distinguishes_multi_image_pixel_lists():
+    # Several images of different sizes arrive as a list of per-image
+    # tensors. Two requests with different images must never share a hash,
+    # or APC replays the first request's answer for the second.
+    image_hash = P.hash_image_payload
+    first = [mx.zeros((1, 3, 8, 8)), mx.zeros((1, 3, 4, 4))]
+    second = [mx.ones((1, 3, 8, 8)), mx.ones((1, 3, 4, 4))]
+    assert image_hash(pixel_values=first) != image_hash(pixel_values=second)
+    assert image_hash(pixel_values=first) != 0
+    x, y = first
+    assert image_hash(pixel_values=[x, None, y]) != image_hash(pixel_values=[x, y, None])
+    assert image_hash(pixel_values=[None], image_ref="a.png") == image_hash(image_ref="a.png")
+    assert image_hash(pixel_values=first) != image_hash(pixel_values=first[::-1])
+
+
 def test_blocks_and_statistics(managers):
     manager = managers(blocks=16)
     tokens = list(range(53))
