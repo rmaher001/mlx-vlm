@@ -189,6 +189,7 @@ class APCCoordinator:
         suffix_is_text_only: Callable[[int], bool],
         prefix_has_media: Callable[[int], bool],
         defer_on_pressure: bool = False,
+        media_lookup: Optional[dict] = None,
     ) -> Optional[dict]:
         if not self.enabled:
             return None
@@ -203,6 +204,7 @@ class APCCoordinator:
             suffix_is_text_only=suffix_is_text_only,
             prefix_has_media=prefix_has_media,
             defer_on_pressure=defer_on_pressure,
+            media_lookup=media_lookup,
         )
         if hit is not None:
             hit["cache_plan"] = self.plan

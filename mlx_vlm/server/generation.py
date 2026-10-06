@@ -853,6 +853,7 @@ class QueuedGenerationRequest:
     videos: Optional[List] = None
     audio: Optional[List] = None
     apc_semantic_hash: Optional[int] = None
+    apc_text_hash: Optional[int] = None
     request_id: Optional[str] = None
     queued_at: float = field(default_factory=time.perf_counter)
     session: Optional[InferenceSession] = None
@@ -1327,6 +1328,7 @@ class ResponseGenerator:
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
         apc_semantic_hash = None
+        apc_text_hash = None
         if getattr(self, "apc_mode", None) is not None:
             pixel_values = raw_inputs.get("pixel_values")
             image_hash = 0
@@ -1334,16 +1336,23 @@ class ResponseGenerator:
                 image_hash = _apc.hash_image_payload(pixel_values=pixel_values)
             elif images is not None:
                 image_hash = _apc.hash_image_payload(image_ref=images)
+            tenant = getattr(args, "tenant_id", None)
+            language_model = getattr(self.model, "language_model", self.model)
             apc_semantic_hash = _apc.semantic_extra_hash(
-                tenant=getattr(args, "tenant_id", None),
+                tenant=tenant,
                 image_hash=image_hash,
                 media={
                     "audio": raw_inputs.get("input_features"),
                     "video": raw_inputs.get("pixel_values_videos"),
                     "second_per_grid_ts": _apc.video_timing_key(raw_inputs),
                 },
-                model=getattr(self.model, "language_model", self.model),
+                model=language_model,
                 processor=self.processor,
+            )
+            # Salt for the text prefix before the first media token: tenant
+            # scoped like the request salt, and equal to a text-only request's.
+            apc_text_hash = _apc.text_extra_hash(
+                tenant=tenant, model=language_model, processor=self.processor
             )
 
         request_id = f"{id(rqueue):x}"
@@ -1366,6 +1375,7 @@ class ResponseGenerator:
             videos=videos,
             audio=audio,
             apc_semantic_hash=apc_semantic_hash,
+            apc_text_hash=apc_text_hash,
             request_id=request_id,
             queued_at=request_started_at,
             session=session,
@@ -1794,6 +1804,7 @@ class ResponseGenerator:
         raw_inputs: dict,
         images=None,
         apc_semantic_hash: Optional[int] = None,
+        apc_text_hash: Optional[int] = None,
     ) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
         input_ids = raw_inputs.get("input_ids")
@@ -1826,6 +1837,8 @@ class ResponseGenerator:
         }
         if apc_semantic_hash is not None:
             gen_kwargs["_apc_semantic_hash"] = apc_semantic_hash
+        if apc_text_hash is not None:
+            gen_kwargs["_apc_text_hash"] = apc_text_hash
         return input_ids, gen_kwargs
 
     def _collect_pending_requests(
@@ -1911,6 +1924,14 @@ class ResponseGenerator:
             batch_gen = BatchGenerator(
                 self.model.language_model,
                 self.processor,
+                media_token_ids=_apc.multimodal_token_ids_from_config(
+                    getattr(self.model, "config", None)
+                ),
+                media_boundary_token_ids=(
+                    _apc.media_boundary_token_ids_from_config(
+                        getattr(self.model, "config", None)
+                    )
+                ),
                 stop_tokens=self.stop_tokens,
                 sampler=self._make_sampler(args),
                 kv_bits=self.kv_bits,
@@ -1945,6 +1966,7 @@ class ResponseGenerator:
             raw_inputs,
             images,
             apc_semantic_hash=request.apc_semantic_hash,
+            apc_text_hash=request.apc_text_hash,
         )
         has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
         if args.cache_checkpoint_len:
