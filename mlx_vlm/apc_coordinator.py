@@ -167,6 +167,7 @@ class APCCoordinator:
         safe_lookup_min: int,
         suffix_is_text_only: Callable[[int], bool],
         prefix_has_media: Callable[[int], bool],
+        media_lookup: Optional[dict] = None,
     ) -> Optional[dict]:
         if not self.enabled:
             return None
@@ -180,6 +181,7 @@ class APCCoordinator:
             safe_lookup_min=safe_lookup_min,
             suffix_is_text_only=suffix_is_text_only,
             prefix_has_media=prefix_has_media,
+            media_lookup=media_lookup,
         )
         if hit is not None:
             hit["cache_plan"] = self.plan
