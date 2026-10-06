@@ -476,14 +476,23 @@ class Gemma4TextModel(nn.Module):
     ) -> mx.array:
         if mm_token_type_ids is None:
             return base_mask
-        if mm_token_type_ids.shape[1] != base_mask.shape[-1]:
-            return base_mask
-        if base_mask.shape[-2] != base_mask.shape[-1]:
+        q_len, k_len = base_mask.shape[-2], base_mask.shape[-1]
+        if mm_token_type_ids.shape[1] != q_len or k_len < q_len:
             return base_mask
 
         block_sequence_ids = self._block_sequence_ids_for_mask(mm_token_type_ids)
+        key_block_ids = block_sequence_ids
+        if k_len > q_len:
+            # Warm start against a cached prefix: those key columns hold no
+            # query block, so they stay causal.
+            pad = mx.full(
+                (block_sequence_ids.shape[0], k_len - q_len),
+                -1,
+                dtype=block_sequence_ids.dtype,
+            )
+            key_block_ids = mx.concatenate([pad, block_sequence_ids], axis=1)
         q_blocks = mx.expand_dims(block_sequence_ids, -1)
-        k_blocks = mx.expand_dims(block_sequence_ids, -2)
+        k_blocks = mx.expand_dims(key_block_ids, -2)
         same_block = (q_blocks != -1) & (q_blocks == k_blocks)
         return base_mask | mx.expand_dims(same_block, 1)
 
@@ -675,6 +684,10 @@ class Gemma4TextModel(nn.Module):
 
 class LanguageModel(nn.Module):
     requires_uniform_batch_acceptance = True
+    # APC may restore a text prefix that ends before the first image and
+    # prefill the rest, images included: the vision mask overlay handles a
+    # warm (cached-prefix) mask and the image embeddings are precomputed.
+    supports_media_suffix_prefill = True
 
     def __init__(self, config: TextConfig):
         super().__init__()

@@ -250,6 +250,20 @@ def semantic_extra_hash(
     return tenant_scoped_hash(tenant, folded)
 
 
+def text_extra_hash(
+    *, tenant: Optional[str] = None, model: Any = None, processor: Any = None
+) -> int:
+    """Salt for cache state that precedes every media token.
+
+    Built from the same inputs the server gives a text-only request (tenant,
+    model and processor dependencies), so a system prompt shared by text and
+    image requests is one entry.
+    """
+    return semantic_extra_hash(
+        tenant=tenant, image_hash=0, model=model, processor=processor
+    )
+
+
 def apc_disk_namespace(
     model_path: str,
     *,
@@ -545,6 +559,42 @@ def media_safe_prefix_min(
     if not spans:
         return 0
     return max(end for _start, end in spans)
+
+
+def media_boundary_token_ids_from_config(config: Any) -> set[int]:
+    """Placeholder tokens whose embeddings depend on a non-token input.
+
+    Image and video placeholders, plus audio: an audio clip before the first
+    image would otherwise count as text and be shared across requests.
+    """
+    ids = multimodal_token_ids_from_config(config)
+    for attr in ("audio_token_id", "audio_token_index"):
+        token_id = getattr(config, attr, None)
+        if token_id is not None:
+            ids.add(int(token_id))
+    return ids
+
+
+def media_prefix_boundary(
+    token_ids: Sequence[int],
+    media_token_ids: Iterable[int],
+    block_size: int,
+) -> int:
+    """Largest block-aligned prefix length that ends before the first media token.
+
+    ``0`` when the prompt holds no media or the first media token sits inside
+    the first block.
+    """
+    media_ids = {int(token_id) for token_id in media_token_ids}
+    if not media_ids:
+        return 0
+    first_media = next(
+        (idx for idx, token_id in enumerate(token_ids) if int(token_id) in media_ids),
+        None,
+    )
+    if first_media is None:
+        return 0
+    return (first_media // block_size) * block_size
 
 
 def prefix_leaves_text_only_suffix(
@@ -1519,6 +1569,10 @@ class DiskBlockStore:
     def has(self, block_hash: int) -> bool:
         with self._index_lock:
             return block_hash in self._index
+
+    def has_exact_cache(self, cache_hash: int) -> bool:
+        with self._index_lock:
+            return cache_hash in self._exact_index
 
     def find_exact_prefix(
         self,
@@ -3527,6 +3581,16 @@ class APCManager:
             self.stats.matched_tokens += prefix_len
         return prompt_cache, prefix_len
 
+    def has_exact_cache(self, token_ids: Sequence[int], *, extra_hash: int = 0) -> bool:
+        """Whether this exact prefix is already retained in memory or on disk."""
+        key = _sequence_hash(
+            tuple(int(t) for t in token_ids), extra_hash, self.block_size
+        )
+        with self.lock:
+            if key in self._exact_cache:
+                return True
+        return self.disk is not None and self.disk.has_exact_cache(key)
+
     def store_exact_cache(
         self,
         token_ids: Sequence[int],
@@ -4657,8 +4721,80 @@ def apc_lookup_plan(
     safe_lookup_min: int,
     suffix_is_text_only,
     prefix_has_media,
+    media_lookup: Optional[dict] = None,
 ) -> Optional[dict]:
-    """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
+    """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply.
+
+    ``media_lookup`` (``extra_hash``: the text-only salt, ``max_prefix_tokens``:
+    the block boundary before the first media token) enables a fallback to the
+    text prefix that precedes the media when the request-specific lookup finds
+    nothing. Only pass it when the caller can prefill a suffix that still holds
+    media tokens.
+    """
+    hit = _apc_lookup_plan_media_safe(
+        manager,
+        ids_list,
+        extra_hash=extra_hash,
+        apc_mode=apc_mode,
+        safe_lookup_min=safe_lookup_min,
+        suffix_is_text_only=suffix_is_text_only,
+        prefix_has_media=prefix_has_media,
+    )
+    if hit is not None or not media_lookup:
+        return hit
+    return _apc_lookup_text_prefix_before_media(
+        manager,
+        ids_list,
+        extra_hash=extra_hash,
+        text_extra_hash=int(media_lookup["extra_hash"]),
+        boundary=int(media_lookup["max_prefix_tokens"]),
+    )
+
+
+def _apc_lookup_text_prefix_before_media(
+    manager: "APCManager",
+    ids_list: Sequence[int],
+    *,
+    extra_hash: int,
+    text_extra_hash: int,
+    boundary: int,
+) -> Optional[dict]:
+    """Restore a checkpoint that stops before the first media token.
+
+    Checkpoints only: block-mode harvests chain every block under the request
+    salt, so no text-salted pre-media blocks exist to find. The prefix is keyed
+    by the text-only salt; the pick keeps the request's own salt so everything
+    stored afterwards (media included) stays request-specific.
+    """
+    n = len(ids_list)
+    if boundary <= 0 or boundary >= n:
+        return None
+    warm_cache, prefix_len = manager.lookup_exact_cache(
+        ids_list, extra_hash=text_extra_hash, max_prefix_tokens=boundary
+    )
+    if prefix_len <= 0:
+        return None
+    return {
+        "matched_blocks": [],
+        "warm_cache": warm_cache,
+        "prefix_len": prefix_len,
+        "extra_hash": extra_hash,
+        "full_input_ids": list(ids_list),
+        "media_in_suffix": True,
+    }
+
+
+def _apc_lookup_plan_media_safe(
+    manager: "APCManager",
+    ids_list: Sequence[int],
+    *,
+    extra_hash: int,
+    apc_mode: str,
+    safe_lookup_min: int,
+    suffix_is_text_only,
+    prefix_has_media,
+) -> Optional[dict]:
+    """The request-specific lookup: the restored prefix must cover every media token."""
     n = len(ids_list)
     if not ids_list or n < 2:
         return None
