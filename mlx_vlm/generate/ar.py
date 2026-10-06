@@ -2064,12 +2064,13 @@ class PromptProcessingBatch:
                 continue
             token_ids = meta["full_input_ids"][:checkpoint_len]
             extra_hash = self._apc_checkpoint_extra_hash(meta, checkpoint_len)
+            # The text prefix before the media is shared: other requests
+            # restore it, so it is stored once and outlives their checkpoints.
+            shared = extra_hash != int(meta.get("extra_hash", 0))
             coordinator = getattr(self, "_apc_coordinator", None)
-            if extra_hash != int(
-                meta.get("extra_hash", 0)
-            ) and self._apc_manager.has_exact_cache(token_ids, extra_hash=extra_hash):
-                # The shared text prefix is stored once, not by every request;
-                # it is as saved as if this request had stored it.
+            if shared and self._apc_manager.has_exact_cache(
+                token_ids, extra_hash=extra_hash
+            ):
                 stored = True
             elif coordinator is not None:
                 stored = coordinator.store_checkpoint(
@@ -2077,6 +2078,7 @@ class PromptProcessingBatch:
                     self.prompt_cache,
                     batch_idx=batch_idx,
                     extra_hash=extra_hash,
+                    shared=shared,
                 )
             else:
                 prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
@@ -2086,11 +2088,12 @@ class PromptProcessingBatch:
                     token_ids,
                     prompt_cache,
                     extra_hash=extra_hash,
+                    shared=shared,
                 )
             meta["checkpoint_stored"] = checkpoint_len
             # Only a request-salted checkpoint stands in for the full-prompt
             # store that the harvest skips; the shared text prefix does not.
-            if extra_hash == int(meta.get("extra_hash", 0)):
+            if not shared:
                 meta["checkpoint_saved"] = meta.get("checkpoint_saved", False) or stored
             meta["checkpoint_done"] = (
                 not self._apc_pending_checkpoint(meta)

@@ -3348,6 +3348,8 @@ def test_checkpoint_before_media_is_stored_under_the_text_salt(managers):
         None,
         0,
     )
+    # It is the shared entry: request checkpoints are evicted before it.
+    assert [e.shared for e in manager._exact_cache.values()] == [True]
     # The shared text prefix does not stand in for this request's own
     # checkpoint, so the full-prompt harvest still runs after it.
     assert not batch._apc_meta[0].get("checkpoint_saved")
@@ -3403,3 +3405,40 @@ def test_gemma4_bidirectional_overlay_on_a_warm_mask():
     assert Gemma4TextModel._apply_blockwise_bidirectional_overlay(
         stub, create_causal_mask(n)[:, :3], mm
     ).shape == (n, 3)
+
+
+def test_shared_text_prefix_checkpoint_outlives_request_checkpoints(managers):
+    """A checkpoint shared across requests (the text prefix before the images)
+    is not the one evicted when an unrelated request stores its own."""
+    manager = managers(blocks=4)
+    manager._exact_cache_max = 2
+    prefix, other, later = list(range(32)), list(range(100, 132)), list(range(200, 232))
+    assert manager.store_exact_cache(prefix, [allocated(32)], extra_hash=1, shared=True)
+    assert manager.store_exact_cache(prefix + [7] * 16, [allocated(48)], extra_hash=2)
+    # An unrelated prompt arrives: the request-specific entry goes, not the shared one.
+    assert manager.store_exact_cache(other, [allocated(32)], extra_hash=3)
+    assert manager.lookup_exact_cache(prefix + [999], extra_hash=1)[1] == 32
+    assert manager.lookup_exact_cache(prefix + [7] * 16 + [999], extra_hash=2) == (
+        None,
+        0,
+    )
+    # The budget still holds: another unrelated store evicts the oldest request entry.
+    assert manager.store_exact_cache(later, [allocated(32)], extra_hash=4)
+    assert manager.lookup_exact_cache(other + [999], extra_hash=3) == (None, 0)
+    assert manager.lookup_exact_cache(prefix + [999], extra_hash=1)[1] == 32
+    # Only when every resident entry is shared does the oldest shared one go.
+    assert manager.store_exact_cache(other, [allocated(32)], extra_hash=5, shared=True)
+    assert manager.store_exact_cache(later, [allocated(32)], extra_hash=6, shared=True)
+    assert manager.lookup_exact_cache(prefix + [999], extra_hash=1) == (None, 0)
+    assert manager.lookup_exact_cache(later + [999], extra_hash=6)[1] == 32
+    # Shared entries never starve a request: the one just stored is spared
+    # and the oldest shared entry goes instead.
+    assert manager.store_exact_cache(prefix, [allocated(32)], extra_hash=7)
+    assert manager.lookup_exact_cache(prefix + [999], extra_hash=7)[1] == 32
+    assert manager.lookup_exact_cache(other + [999], extra_hash=5) == (None, 0)
+    assert manager.lookup_exact_cache(later + [999], extra_hash=6)[1] == 32
+    # Memory pressure picks the same victims: request entries first.
+    manager.memory_max_bytes = 1
+    manager.memory_reserve_bytes = 0
+    assert not manager._make_room(1 << 40)
+    assert [e.shared for e in manager._exact_cache.values()] in ([], [True])
