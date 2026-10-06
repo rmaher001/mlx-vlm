@@ -2149,3 +2149,117 @@ def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
     assert eval_mock.call_count == 1 + cache_evals
     if cache_evals:
         eval_mock.assert_called_with([cache_state])
+
+
+def _checkpoint_language_model():
+    """A language model as the server hands it over: no media ids in its own
+    config, a windowed cache (checkpoint strategy), and the opt-in flag."""
+    from mlx_vlm.models.cache import RotatingKVCache
+
+    lm = MockLanguageModel()
+    lm.config = SimpleNamespace()
+    lm.make_cache = lambda: [RotatingKVCache(max_size=8)]
+    lm.supports_media_suffix_prefill = True
+    return lm
+
+
+def _checkpoint_generator(mock_processor, img=999, audio=998, **kwargs):
+    lm = _checkpoint_language_model()
+    generator = ar_module.BatchGenerator(
+        lm,
+        mock_processor,
+        apc_manager=apc_module.APCManager(num_blocks=4),
+        media_token_ids={img},
+        media_boundary_token_ids={img, audio},
+        **kwargs,
+    )
+    assert generator._apc_uses_checkpoints()
+    return lm, generator
+
+
+def test_batch_generator_media_lookup_needs_model_opt_in(mock_processor):
+    img, audio = 999, 998
+    lm, generator = _checkpoint_generator(mock_processor)
+    ids = list(range(32)) + [img] * 8 + [1, 2]
+    lm.supports_media_suffix_prefill = False
+    assert generator._apc_media_lookup(ids, {"_apc_tenant": "t"}) is None
+    lm.supports_media_suffix_prefill = True
+    assert generator._apc_media_lookup(ids, {"_apc_tenant": "t"}) == {
+        "extra_hash": apc_module.text_extra_hash(
+            tenant="t", model=lm, processor=mock_processor
+        ),
+        "max_prefix_tokens": 32,
+    }
+    # The server's precomputed, tenant-scoped text salt wins over the tenant.
+    assert generator._apc_media_lookup(ids, {"_apc_text_hash": 77})["extra_hash"] == 77
+    # An audio clip before the first image ends the text prefix too.
+    assert (
+        generator._apc_media_boundary(list(range(20)) + [audio] * 4 + [img] * 4) == 16
+    )
+    assert generator._apc_media_lookup(list(range(40)), {"_apc_tenant": "t"}) is None
+    # Without injected ids the language model's own config has none.
+    bare = ar_module.BatchGenerator(
+        lm, mock_processor, apc_manager=apc_module.APCManager(num_blocks=4)
+    )
+    assert bare._apc_media_boundary(ids) == 0
+
+
+def test_batch_generator_media_boundary_needs_checkpoints(mock_processor):
+    img = 999
+    ids = list(range(32)) + [img] * 8 + [1, 2]
+    lm = _checkpoint_language_model()
+    lm.make_cache = lambda: [KVCache()]  # dense: block strategy
+    generator = ar_module.BatchGenerator(
+        lm,
+        mock_processor,
+        apc_manager=apc_module.APCManager(num_blocks=4),
+        media_token_ids={img},
+        media_boundary_token_ids={img},
+    )
+    assert not generator._apc_uses_checkpoints()
+    assert generator._apc_media_boundary(ids) == 0
+    off = ar_module.BatchGenerator(lm, mock_processor, media_token_ids={img})
+    assert off._apc_media_boundary(ids) == 0
+
+
+def test_batch_generator_media_boundary_checkpoint_budget(mock_processor):
+    img = 999
+    ids = list(range(32)) + [img] * 8 + list(range(100, 140))  # 80 tokens
+    lm, generator = _checkpoint_generator(mock_processor)
+    manager = generator.apc_manager
+    manager.exact_cache_min_tokens = 16
+    with_boundary = generator._apc_with_media_boundary
+    # Room in the budget: the boundary is simply added, once.
+    manager._exact_cache_max = 3
+    assert with_boundary(ids, [64, 79]) == [32, 64, 79]
+    assert with_boundary(ids, [32, 79]) == [32, 79]
+    # A full budget keeps the boundary and the final checkpoint and drops
+    # the oldest intermediate, so the LRU never evicts the shared prefix.
+    manager._exact_cache_max = 2
+    assert with_boundary(ids, [64, 79]) == [32, 79]
+    manager._exact_cache_max = 3
+    assert with_boundary(ids, [48, 64, 79]) == [32, 64, 79]
+    # No budget for both: leave the lengths alone.
+    manager._exact_cache_max = 1
+    assert with_boundary(ids, [79]) == [79]
+    # A disk-only manager captures two, like the coordinator.
+    manager._exact_cache_max = 0
+    manager.disk = object()
+    assert with_boundary(ids, [64, 79]) == [32, 79]
+    manager.disk = None
+    assert with_boundary(ids, [79]) == [79]
+    # Below the minimum checkpoint size, or without media, nothing is added.
+    manager._exact_cache_max = 3
+    manager.exact_cache_min_tokens = 48
+    assert with_boundary(ids, [79]) == [79]
+    manager.exact_cache_min_tokens = 16
+    assert with_boundary(list(range(80)), [79]) == [79]
+    assert with_boundary(list(range(32)) + [img] * 8, [39]) == [32, 39]
+    # The cold-path meta carries the boundary and its salt; text-only rows
+    # carry neither.
+    meta = generator._build_apc_meta_for_cold(
+        [ids, list(range(80))], [{"_apc_text_hash": 5}, {"_apc_text_hash": 5}]
+    )
+    assert (meta[0]["media_boundary"], meta[0]["text_extra_hash"]) == (32, 5)
+    assert (meta[1]["media_boundary"], meta[1]["text_extra_hash"]) == (0, None)
+    assert 32 in meta[0]["checkpoint_lengths"]

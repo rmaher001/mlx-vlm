@@ -9,7 +9,7 @@ import time
 import warnings
 from collections.abc import Generator
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -628,6 +628,7 @@ APC_PRIVATE_PROMPT_KEYS = (
     "_apc_tenant",
     "_apc_image_hash",
     "_apc_semantic_hash",
+    "_apc_text_hash",
 )
 
 
@@ -1992,6 +1993,17 @@ class PromptProcessingBatch:
             return suffix_checkpoint
         return self._left_padding_per_row[batch_idx] + checkpoint_len - prefix_len
 
+    @staticmethod
+    def _apc_checkpoint_extra_hash(meta: dict, checkpoint_len: int) -> int:
+        """A checkpoint that ends before the first media token carries the
+        text-only salt, so the next request with other images can restore it."""
+        text_extra_hash = meta.get("text_extra_hash")
+        if text_extra_hash is not None and checkpoint_len <= int(
+            meta.get("media_boundary") or 0
+        ):
+            return int(text_extra_hash)
+        return int(meta.get("extra_hash", 0))
+
     def _apc_pending_checkpoint(self, meta: dict) -> int:
         lengths = meta.get("checkpoint_lengths")
         if lengths is None:
@@ -2050,25 +2062,36 @@ class PromptProcessingBatch:
                 continue
             if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
                 continue
+            token_ids = meta["full_input_ids"][:checkpoint_len]
+            extra_hash = self._apc_checkpoint_extra_hash(meta, checkpoint_len)
             coordinator = getattr(self, "_apc_coordinator", None)
-            if coordinator is not None:
+            if extra_hash != int(
+                meta.get("extra_hash", 0)
+            ) and self._apc_manager.has_exact_cache(token_ids, extra_hash=extra_hash):
+                # The shared text prefix is stored once, not by every request;
+                # it is as saved as if this request had stored it.
+                stored = True
+            elif coordinator is not None:
                 stored = coordinator.store_checkpoint(
-                    meta["full_input_ids"][:checkpoint_len],
+                    token_ids,
                     self.prompt_cache,
                     batch_idx=batch_idx,
-                    extra_hash=meta.get("extra_hash", 0),
+                    extra_hash=extra_hash,
                 )
             else:
                 prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
                 if prompt_cache is None:
                     continue
                 stored = self._apc_manager.store_exact_cache(
-                    meta["full_input_ids"][:checkpoint_len],
+                    token_ids,
                     prompt_cache,
-                    extra_hash=meta.get("extra_hash", 0),
+                    extra_hash=extra_hash,
                 )
             meta["checkpoint_stored"] = checkpoint_len
-            meta["checkpoint_saved"] = meta.get("checkpoint_saved", False) or stored
+            # Only a request-salted checkpoint stands in for the full-prompt
+            # store that the harvest skips; the shared text prefix does not.
+            if extra_hash == int(meta.get("extra_hash", 0)):
+                meta["checkpoint_saved"] = meta.get("checkpoint_saved", False) or stored
             meta["checkpoint_done"] = (
                 not self._apc_pending_checkpoint(meta)
                 if "checkpoint_lengths" in meta
@@ -2484,10 +2507,22 @@ class BatchGenerator:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        media_token_ids: Optional[Iterable[int]] = None,
+        media_boundary_token_ids: Optional[Iterable[int]] = None,
     ):
         self.model = model
         self.max_tokens = max_tokens
         self.processor = processor
+        # The server hands over the language model, whose config has no media
+        # token ids; it injects them from the outer model's config instead.
+        self._media_token_ids = (
+            {int(t) for t in media_token_ids} if media_token_ids is not None else None
+        )
+        self._media_boundary_token_ids = (
+            {int(t) for t in media_boundary_token_ids}
+            if media_boundary_token_ids is not None
+            else None
+        )
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
         self.kv_value_bits = kv_value_bits
@@ -2582,11 +2617,74 @@ class BatchGenerator:
             processor=getattr(self, "processor", None),
         )
 
+    def _apc_text_extra_hash(self, prompt_kwargs: dict) -> int:
+        """Salt for cache state that precedes every media token.
+
+        The server precomputes it with the tenant folded in (``_apc_text_hash``);
+        the tenant itself only travels when no precomputed hash does.
+        """
+        precomputed = prompt_kwargs.get("_apc_text_hash")
+        if precomputed is not None:
+            return int(precomputed)
+        return _apc.text_extra_hash(
+            tenant=prompt_kwargs.get("_apc_tenant"),
+            model=getattr(self, "model", None),
+            processor=getattr(self, "processor", None),
+        )
+
     def _apc_media_token_ids(self) -> set[int]:
+        injected = getattr(self, "_media_token_ids", None)
+        if injected is not None:
+            return injected
         config = getattr(self.model, "config", None)
         if config is None:
             return set()
         return _apc.multimodal_token_ids_from_config(config)
+
+    def _apc_media_boundary_token_ids(self) -> set[int]:
+        injected = getattr(self, "_media_boundary_token_ids", None)
+        if injected is not None:
+            return injected
+        config = getattr(self.model, "config", None)
+        if config is None:
+            return set()
+        return _apc.media_boundary_token_ids_from_config(config)
+
+    def _apc_uses_checkpoints(self) -> bool:
+        coordinator = getattr(self, "apc", None)
+        if coordinator is not None:
+            return coordinator.is_checkpoint
+        return getattr(self, "apc_mode", "block") == "exact"
+
+    def _apc_media_boundary(self, ids_list: List[int]) -> int:
+        """Block boundary before the first media token, when the language
+        model can prefill a suffix that still holds media; else ``0``.
+
+        Checkpoint strategies only: the boundary is stored as a checkpoint
+        under the text salt, and a block harvest has no such store.
+        """
+        if self.apc_manager is None or not self._apc_uses_checkpoints():
+            return 0
+        language_model = getattr(self.model, "language_model", self.model)
+        if not getattr(language_model, "supports_media_suffix_prefill", False):
+            return 0
+        return _apc.media_prefix_boundary(
+            ids_list,
+            self._apc_media_boundary_token_ids(),
+            self.apc_manager.block_size,
+        )
+
+    def _apc_media_lookup(
+        self, ids_list: List[int], prompt_kwargs: Optional[dict]
+    ) -> Optional[dict]:
+        """Lookup parameters for the text prefix before the first media token."""
+        boundary = self._apc_media_boundary(ids_list)
+        if boundary <= 0:
+            return None
+        return {
+            "extra_hash": self._apc_text_extra_hash(prompt_kwargs or {}),
+            "max_prefix_tokens": boundary,
+        }
 
     def _apc_safe_prefix_lookup_min(self, ids_list: List[int]) -> int:
         safe_min = _apc.media_safe_prefix_min(ids_list, self._apc_media_token_ids())
@@ -2624,9 +2722,47 @@ class BatchGenerator:
     def _apc_exact_checkpoint_lengths(self, ids_list: List[int]) -> List[int]:
         coordinator = getattr(self, "apc", None)
         if coordinator is not None:
-            return coordinator.checkpoint_lengths(ids_list, self._apc_media_token_ids())
-        boundary = self._apc_exact_checkpoint_len(ids_list)
-        return [boundary] if boundary > 0 else []
+            lengths = coordinator.checkpoint_lengths(
+                ids_list, self._apc_media_token_ids()
+            )
+        else:
+            boundary = self._apc_exact_checkpoint_len(ids_list)
+            lengths = [boundary] if boundary > 0 else []
+        return self._apc_with_media_boundary(ids_list, lengths)
+
+    def _apc_with_media_boundary(
+        self, ids_list: List[int], lengths: List[int]
+    ) -> List[int]:
+        """Add the text-prefix checkpoint before the first media token.
+
+        The resident checkpoint budget is kept: the boundary and the final
+        checkpoint come first, and the newest intermediates fill what is left,
+        so the shared prefix is not the entry the LRU evicts.
+        """
+        boundary = self._apc_media_boundary(ids_list)
+        if boundary <= 0:
+            return lengths
+        if (
+            boundary < self.apc_manager.exact_cache_min_tokens
+            or boundary in lengths
+            or boundary >= len(ids_list)
+        ):
+            return lengths
+        # Same budget the coordinator sizes its captures to.
+        budget = self.apc_manager._exact_cache_max or (
+            2 if self.apc_manager.disk else 1
+        )
+        if len(lengths) < budget:
+            return sorted([*lengths, boundary])
+        keep = [boundary]
+        if lengths:
+            keep.append(max(lengths))
+        if len(keep) > budget:
+            return lengths
+        intermediates = [n for n in lengths if n not in keep]
+        room = budget - len(keep)
+        keep.extend(intermediates[len(intermediates) - room :] if room else [])
+        return sorted(keep)
 
     def _apc_pick_for(self, sequence) -> Optional[dict]:
         """Look up an APC prefix for ``sequence``. Returns dict with matched
@@ -2647,6 +2783,7 @@ class BatchGenerator:
             "prefix_has_media": lambda pl: self._apc_prefix_has_media_tokens(
                 ids_list, pl
             ),
+            "media_lookup": self._apc_media_lookup(ids_list, prompt_kwargs),
         }
         if coordinator is not None:
             return coordinator.lookup(ids_list, **lookup_kwargs)
@@ -2802,6 +2939,7 @@ class BatchGenerator:
                 "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
                 "checkpoint_len": self._apc_exact_checkpoint_len(full_ids[i]),
                 "checkpoint_lengths": self._apc_exact_checkpoint_lengths(full_ids[i]),
+                **self._apc_text_prefix_meta(full_ids[i], prompt_kwargs_list[i]),
             }
             for i in range(len(sequences))
         ]
@@ -2865,9 +3003,22 @@ class BatchGenerator:
                     "checkpoint_lengths": self._apc_exact_checkpoint_lengths(
                         list(ids_list)
                     ),
+                    **self._apc_text_prefix_meta(list(ids_list), kw),
                 }
             )
         return meta
+
+    def _apc_text_prefix_meta(
+        self, ids_list: List[int], prompt_kwargs: Optional[dict]
+    ) -> dict:
+        """Where the text prefix ends and the salt its checkpoint is stored under."""
+        boundary = self._apc_media_boundary(ids_list)
+        return {
+            "media_boundary": boundary,
+            "text_extra_hash": (
+                self._apc_text_extra_hash(prompt_kwargs or {}) if boundary > 0 else None
+            ),
+        }
 
     @property
     def stream(self):

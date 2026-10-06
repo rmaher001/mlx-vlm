@@ -1180,8 +1180,12 @@ def test_image_hash_distinguishes_multi_image_pixel_lists():
     assert image_hash(pixel_values=first) != image_hash(pixel_values=second)
     assert image_hash(pixel_values=first) != 0
     x, y = first
-    assert image_hash(pixel_values=[x, None, y]) != image_hash(pixel_values=[x, y, None])
-    assert image_hash(pixel_values=[None], image_ref="a.png") == image_hash(image_ref="a.png")
+    assert image_hash(pixel_values=[x, None, y]) != image_hash(
+        pixel_values=[x, y, None]
+    )
+    assert image_hash(pixel_values=[None], image_ref="a.png") == image_hash(
+        image_ref="a.png"
+    )
     assert image_hash(pixel_values=first) != image_hash(pixel_values=first[::-1])
 
 
@@ -3227,3 +3231,175 @@ def test_restored_tokens_count_successful_restores(
     manager.reset_stats()
     assert manager.stats_snapshot()["restored_tokens"] == 0
     assert manager.stats_snapshot()["stored_tokens"] == 0
+
+
+# --- APC: reuse the text prefix that precedes the first image ---------------
+
+
+def test_media_prefix_boundary():
+    img = 7
+    ids = [1] * 40 + [img] * 5 + [2] * 3
+    assert P.media_prefix_boundary(ids, {img}, 16) == 32
+    assert P.media_prefix_boundary([1] * 40, {img}, 16) == 0
+    assert P.media_prefix_boundary([img] * 20 + [1] * 20, {img}, 16) == 0
+    assert P.media_prefix_boundary(ids, set(), 16) == 0
+
+
+def test_text_extra_hash_matches_a_text_only_request():
+    assert P.text_extra_hash(tenant="t") == P.semantic_extra_hash(
+        tenant="t", image_hash=0
+    )
+    assert P.text_extra_hash(tenant="t") != P.semantic_extra_hash(
+        tenant="t", image_hash=5
+    )
+
+
+def test_media_boundary_token_ids_include_audio():
+    config = NS(image_token_id=5, video_token_index=6, audio_token_id=7)
+    assert P.multimodal_token_ids_from_config(config) == {5, 6}
+    assert P.media_boundary_token_ids_from_config(config) == {5, 6, 7}
+    assert P.media_boundary_token_ids_from_config(NS()) == set()
+
+
+@parametrize("tier", ["memory", "disk"])
+def test_lookup_plan_restores_text_prefix_before_media(managers, tier):
+    img, text_salt, full_salt = 999, 11, 22
+    ids = list(range(32)) + [img] * 8 + [100, 101]
+    manager = managers(tier, blocks=8, block=16)
+    assert manager.store_exact_cache(ids[:32], [allocated(32)], extra_hash=text_salt)
+    if tier == "disk":
+        manager.disk.flush()
+        manager._exact_cache.clear()
+    common = dict(
+        extra_hash=full_salt,
+        apc_mode="exact",
+        safe_lookup_min=39,
+        suffix_is_text_only=lambda pl: pl >= 40,
+        prefix_has_media=lambda pl: pl > 32,
+    )
+    # The request's own salt never matches, and the text-only-suffix rule
+    # would reject a prefix that stops before the images.
+    assert P.apc_lookup_plan(manager, ids, **common) is None
+    lookup = lambda boundary: P.apc_lookup_plan(
+        manager,
+        ids,
+        media_lookup={"extra_hash": text_salt, "max_prefix_tokens": boundary},
+        **common,
+    )
+    hit = lookup(32)
+    assert hit is not None and hit["prefix_len"] == 32
+    assert hit["media_in_suffix"] is True
+    # Later stores of this request (images included) keep the full salt.
+    assert hit["extra_hash"] == full_salt
+    # A boundary that leaves no suffix, or none at all, is not a hit.
+    assert lookup(len(ids)) is None and lookup(0) is None
+
+
+def test_has_exact_cache_sees_memory_and_disk(managers):
+    tokens = list(range(32))
+    manager = managers("disk", blocks=4)
+    assert not manager.has_exact_cache(tokens, extra_hash=3)
+    assert manager.store_exact_cache(tokens, [allocated(32)], extra_hash=3)
+    assert manager.has_exact_cache(tokens, extra_hash=3)
+    assert not manager.has_exact_cache(tokens, extra_hash=4)
+    manager.disk.flush()
+    manager._exact_cache.clear()
+    assert manager.has_exact_cache(tokens, extra_hash=3)
+
+
+def test_checkpoint_before_media_is_stored_under_the_text_salt(managers):
+    img, text_salt, full_salt = 999, 11, 22
+    tokens = list(range(32)) + [img] * 8 + list(range(100, 108))
+    manager = managers(blocks=4, block=16)
+
+    def batch_at(columns):
+        batch = PromptProcessingBatch.__new__(PromptProcessingBatch)
+        batch.__dict__.update(
+            uids=[0],
+            prompt_cache=[allocated(48)],
+            _right_pad_per_row=None,
+            _left_padding_per_row=[0],
+            _suffix_lens=[48],
+            _processed_prompt_columns=columns,
+            _apc_mode="exact",
+            _apc_manager=manager,
+            _apc_meta=[
+                dict(
+                    full_input_ids=tokens,
+                    prefix_len=0,
+                    checkpoint_lengths=[32, 47],
+                    extra_hash=full_salt,
+                    text_extra_hash=text_salt,
+                    media_boundary=32,
+                )
+            ],
+        )
+        return batch
+
+    batch = batch_at(32)
+    batch._store_apc_exact_checkpoints()
+    assert batch._apc_meta[0]["checkpoint_stored"] == 32
+    assert manager.stats.exact_stores == 1
+    restored, count = manager.lookup_exact_cache(
+        tokens[:32] + [999], extra_hash=text_salt
+    )
+    assert restored is not None and count == 32
+    assert manager.lookup_exact_cache(tokens[:32] + [999], extra_hash=full_salt) == (
+        None,
+        0,
+    )
+    # The shared text prefix does not stand in for this request's own
+    # checkpoint, so the full-prompt harvest still runs after it.
+    assert not batch._apc_meta[0].get("checkpoint_saved")
+    # The same text prefix on the next request is not stored a second time.
+    again = batch_at(32)
+    again._store_apc_exact_checkpoints()
+    assert manager.stats.exact_stores == 1
+    assert again._apc_meta[0]["checkpoint_stored"] == 32
+    assert not again._apc_meta[0].get("checkpoint_saved")
+    # The checkpoint after the images keeps the request's own salt.
+    again._processed_prompt_columns = 47
+    again._store_apc_exact_checkpoints()
+    assert again._apc_meta[0]["checkpoint_stored"] == 47
+    assert again._apc_meta[0]["checkpoint_saved"] is True
+    restored, count = manager.lookup_exact_cache(
+        tokens[:47] + [999], extra_hash=full_salt
+    )
+    assert restored is not None and count == 47
+    # Under the text salt only the pre-media prefix is reachable.
+    assert (
+        manager.lookup_exact_cache(tokens[:47] + [999], extra_hash=text_salt)[1] == 32
+    )
+    # A prompt without media has no text salt and stores under its own.
+    assert (
+        PromptProcessingBatch._apc_checkpoint_extra_hash(
+            dict(extra_hash=full_salt, text_extra_hash=None, media_boundary=0), 32
+        )
+        == full_salt
+    )
+
+
+def test_gemma4_bidirectional_overlay_on_a_warm_mask():
+    from mlx_vlm.models.gemma4.language import Gemma4TextModel
+
+    stub = SimpleNamespace(
+        _block_sequence_ids_for_mask=lambda m: Gemma4TextModel._block_sequence_ids_for_mask(
+            None, m
+        )
+    )
+    offset, n = 4, 6
+    mm = mx.array([[0, 1, 1, 1, 0, 0]])
+    base = create_causal_mask(n, offset)
+    out = Gemma4TextModel._apply_blockwise_bidirectional_overlay(stub, base, mm)
+    expected = [list(row) for row in base.tolist()]
+    for q in range(1, 4):
+        for k in range(1, 4):
+            expected[q][offset + k] = True
+    assert out.shape == (1, 1, n, offset + n)
+    assert out[0, 0].tolist() == expected
+    # The cached prefix columns stay causal for the vision rows too.
+    assert out[0, 0, 1:4, :offset].tolist() == base[1:4, :offset].tolist()
+    # A mask with fewer key columns than queries is left alone.
+    assert Gemma4TextModel._apply_blockwise_bidirectional_overlay(
+        stub, create_causal_mask(n)[:, :3], mm
+    ).shape == (n, 3)

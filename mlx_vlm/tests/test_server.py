@@ -3703,7 +3703,7 @@ def _worker_setup(
 
     if initialize:
         gen._initialize_model = fake_initialize
-    gen._gpu_embed = lambda raw, images=None, apc_semantic_hash=None: (
+    gen._gpu_embed = lambda raw, images=None, **apc_hashes: (
         mx.array([[raw["request_id"]]], dtype=mx.int32),
         {},
     )
@@ -3872,6 +3872,34 @@ class TestResponseGenerator:
                 model=gen.model.language_model,
                 processor=gen.processor,
             )
+
+    def test_text_prefix_salt_is_tenant_scoped(self):
+        gen = _ready_generator(
+            apc_manager=object(),
+            apc_mode="exact",
+            model=NS(language_model=NS()),
+            processor=NS(),
+        )
+        pixels = mx.full((1, 3, 2, 2), 1, dtype=mx.float32)
+        gen._preprocess_request = MagicMock(
+            return_value=dict(input_ids=mx.array([[1, 2]]), pixel_values=pixels)
+        )
+        queued = _capture_requests(gen, prompt_tokens=2)
+        for tenant in ("a", "b"):
+            _, tokens = gen.generate(
+                "prompt",
+                images=["image.png"],
+                args=Args(max_tokens=1, tenant_id=tenant),
+            )
+            tokens.close()
+        # The text prefix before the images is salted per tenant, like the
+        # request itself, and equals that tenant's text-only salt.
+        assert queued[0].apc_text_hash != queued[1].apc_text_hash
+        for request, tenant in zip(queued, ("a", "b")):
+            assert request.apc_text_hash == apc.text_extra_hash(
+                tenant=tenant, model=gen.model.language_model, processor=gen.processor
+            )
+            assert request.apc_text_hash != request.apc_semantic_hash
 
     def test_runtime_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")
@@ -4061,6 +4089,26 @@ class TestResponseGenerator:
                 (str(ctx.uid * 10), None),
                 (str(ctx.uid * 10 + 1), "length"),
             ]
+
+    def test_batch_generator_gets_media_ids_from_the_outer_config(self, monkeypatch):
+        gen, batches = _worker_setup(monkeypatch)
+
+        def initialize():
+            # The language model handed to the batch generator has no media
+            # ids of its own; they come from the outer model's config.
+            gen.model = NS(
+                language_model=object(),
+                config=NS(image_token_id=5, audio_token_id=7),
+            )
+            gen.processor, gen.config, gen.tokenizer = (NS(), NS(), NS())
+            gen.draft_model, gen.draft_kind = None, None
+
+        gen._initialize_model = initialize
+        queue = _enqueue(gen, 1, max_tokens=1)
+        with _running(gen):
+            _drain(queue)
+        assert batches[0].kwargs["media_token_ids"] == {5}
+        assert batches[0].kwargs["media_boundary_token_ids"] == {5, 7}
 
     @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
     def test_speculative_batch_options_and_apc(self, monkeypatch, draft_kind):
@@ -4325,14 +4373,25 @@ class TestResponseGenerator:
         raw = dict(input_ids=mx.array([[1, 2]]), attention_mask=mx.array([[1, 1]]))
         if image:
             raw["pixel_values"] = pixels
+        text_hash = apc.text_extra_hash() if image else None
         _, kwargs = Generator._gpu_embed(
-            gen, raw, images=None, apc_semantic_hash=semantic_hash
+            gen,
+            raw,
+            images=None,
+            apc_semantic_hash=semantic_hash,
+            apc_text_hash=text_hash,
         )
         assert "position_ids" not in kwargs and "rope_deltas" not in kwargs
         assert (
             kwargs["_apc_semantic_hash"] == semantic_hash
             if image
             else "_apc_semantic_hash" not in kwargs
+        )
+        # The text-prefix salt travels the same way, as a private kwarg.
+        assert (
+            kwargs["_apc_text_hash"] == text_hash
+            if image
+            else "_apc_text_hash" not in kwargs
         )
 
     @pytest.mark.parametrize(
