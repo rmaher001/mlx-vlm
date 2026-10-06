@@ -662,6 +662,9 @@ class APCExactCacheEntry:
     token_ids: Tuple[int, ...]
     extra_hash: int
     prompt_cache: List[Any]
+    # Reused across requests (the text prefix before the first media token):
+    # evicted only after every request-specific entry.
+    shared: bool = False
 
 
 @dataclass(frozen=True)
@@ -3356,10 +3359,9 @@ class APCManager:
             evicted = 0
             while resident > target:
                 if self._exact_cache:
-                    resident -= _cache_nbytes(
-                        self._exact_cache[next(iter(self._exact_cache))].prompt_cache
-                    )
-                    self._exact_cache.popitem(last=False)
+                    victim = self._exact_victim_locked()
+                    resident -= _cache_nbytes(self._exact_cache[victim].prompt_cache)
+                    del self._exact_cache[victim]
                 else:
                     block = self._free_head
                     while block is not None and block.block_hash is None:
@@ -3547,11 +3549,9 @@ class APCManager:
                                                 )
                                             )
                                             self._exact_cache.move_to_end(promote_key)
-                                            while (
-                                                len(self._exact_cache)
-                                                > self._exact_cache_max
-                                            ):
-                                                self._exact_cache.popitem(last=False)
+                                            self._evict_exact_overflow_locked(
+                                                keep=promote_key
+                                            )
                                     return prompt_cache, disk_prefix_len
                             with self.lock:
                                 self.stats.exact_hits += 1
@@ -3591,14 +3591,42 @@ class APCManager:
                 return True
         return self.disk is not None and self.disk.has_exact_cache(key)
 
+    def _exact_victim_locked(self, keep: Optional[int] = None) -> Optional[int]:
+        """Key of the resident checkpoint to drop next: the oldest
+        request-specific entry, else the oldest shared one. ``keep`` (the
+        entry just stored) is spared unless it is the only one."""
+        candidates = [k for k in self._exact_cache if k != keep] or list(
+            self._exact_cache
+        )
+        if not candidates:
+            return None
+        for k in candidates:
+            if not self._exact_cache[k].shared:
+                return k
+        return candidates[0]
+
+    def _evict_exact_overflow_locked(self, keep: Optional[int] = None) -> None:
+        """Drop resident checkpoints down to the budget; a shared entry only
+        once no request-specific entry is left to drop."""
+        while len(self._exact_cache) > self._exact_cache_max:
+            victim = self._exact_victim_locked(keep)
+            if victim is None:
+                break
+            del self._exact_cache[victim]
+
     def store_exact_cache(
         self,
         token_ids: Sequence[int],
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        shared: bool = False,
     ) -> bool:
-        """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        """Store a full prompt-cache snapshot for exact-prefix reuse.
+
+        ``shared`` marks a checkpoint other requests restore too; it outlives
+        the request-specific ones in the resident LRU.
+        """
         if len(token_ids) < self.exact_cache_min_tokens:
             return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
@@ -3656,10 +3684,10 @@ class APCManager:
                     token_ids=token_tuple,
                     extra_hash=int(extra_hash),
                     prompt_cache=copied,
+                    shared=shared,
                 )
                 self._exact_cache.move_to_end(key)
-                while len(self._exact_cache) > self._exact_cache_max:
-                    self._exact_cache.popitem(last=False)
+                self._evict_exact_overflow_locked(keep=key)
                 stored = True
         if stored:
             apc_trace(
@@ -3892,8 +3920,7 @@ class APCManager:
                         prompt_cache=copied,
                     )
                     self._exact_cache.move_to_end(key)
-                    while len(self._exact_cache) > self._exact_cache_max:
-                        self._exact_cache.popitem(last=False)
+                    self._evict_exact_overflow_locked(keep=key)
                     self.stats.exact_stores += 1
                     layer_major_stored = True
             parent = SEED_PARENT_HASH
