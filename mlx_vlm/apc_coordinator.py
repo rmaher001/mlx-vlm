@@ -319,6 +319,7 @@ class APCCoordinator:
         *,
         extra_hash: int = 0,
         batch_idx: Optional[int] = None,
+        shared: bool = False,
     ) -> bool:
         if not self.enabled or not self.is_checkpoint:
             return False
@@ -341,7 +342,7 @@ class APCCoordinator:
         if snapshot is None:
             return False
         return self.manager.store_exact_cache(
-            token_ids, snapshot, extra_hash=extra_hash
+            token_ids, snapshot, extra_hash=extra_hash, shared=shared
         )
 
     def commit(
